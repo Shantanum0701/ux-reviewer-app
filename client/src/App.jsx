@@ -37,7 +37,7 @@ function useAuditStatus(auditId) {
 
         const interval = setInterval(async () => {
             try {
-                const res = await axios.get(`/api/audits/${auditId}`);
+                const res = await axios.get(`/api/status/${auditId}`);
                 console.log("Polling result:", res.data);
                 if (res.data.status === 'completed') {
                     setResult(res.data.result); // ensure parsed json
@@ -73,7 +73,7 @@ export default function App() {
 
     const fetchRecent = async () => {
         try {
-            const res = await axios.get('/api/audits');
+            const res = await axios.get('/api/history');
             setRecentAudits(res.data);
         } catch (e) { console.error(e); }
     };
@@ -83,7 +83,7 @@ export default function App() {
         if (!url) return;
         try {
             const res = await axios.post('/api/analyze', { url });
-            setAuditId(res.data.id);
+            setAuditId(res.data.auditId);
         } catch (e) {
             alert("Failed to start audit: " + e.message);
         }
