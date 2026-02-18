@@ -2,7 +2,7 @@ import puppeteer from "puppeteer";
 import OpenAI from "openai";
 
 const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
+    apiKey: process.env.OPENAI_API_KEY || "dummy-key-for-demo-mode"
 });
 
 export async function runAudit(url) {
