@@ -3,6 +3,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import { runAudit } from './audit.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 dotenv.config();
 
@@ -14,7 +16,7 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/ux-aud
 app.use(cors());
 app.use(express.json());
 
-// Database Setup
+// Database Setup (Non-blocking)
 mongoose.connect(MONGODB_URI)
     .then(() => console.log('Connected to MongoDB'))
     .catch(err => console.error('MongoDB connection error:', err));
@@ -25,15 +27,19 @@ const auditSchema = new mongoose.Schema({
     timestamp: { type: Date, default: Date.now },
     score: { type: Number },
     status: { type: String, default: 'pending', enum: ['pending', 'processing', 'completed', 'failed'] },
-    result: { type: Object }, // Store JSON result directly
+    result: { type: Object },
     error: { type: String }
 });
 
 const Audit = mongoose.model('Audit', auditSchema);
 
-// Routes
+// In-memory fallback
+const localAudits = [];
+
+// --- ROUTES ---
+
 app.get('/api/status', (req, res) => {
-    const isMock = !process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY.includes('XXXX');
+    const isMock = !process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY.includes('XXXX') || process.env.OPENAI_API_KEY.includes('dummy');
     res.json({
         status: 'ok',
         database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
@@ -42,94 +48,130 @@ app.get('/api/status', (req, res) => {
     });
 });
 
-app.get('/api/audits', async (req, res) => { // Made async
-    try {
-        const audits = await Audit.find().sort({ timestamp: -1 }).limit(5); // Mongoose query
-        res.json(audits);
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to fetch audits' });
-    }
-});
-
 app.post('/api/analyze', async (req, res) => {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ error: 'URL is required' });
-
     try {
-        const newAudit = new Audit({ url, status: 'pending' });
-        const savedAudit = await newAudit.save();
-        const auditId = savedAudit._id;
+        const { url } = req.body;
+        if (!url) return res.status(400).json({ error: 'URL is required' });
 
-        // Trigger async processing
-        processAudit(auditId, url).catch(console.error);
+        const tempId = new mongoose.Types.ObjectId();
 
-        res.json({ id: auditId, status: 'pending' });
+        // Try to save to DB if connected
+        if (mongoose.connection.readyState === 1) {
+            const newAudit = new Audit({ _id: tempId, url, status: 'pending' });
+            await newAudit.save();
+        } else {
+            console.log("DB disconnected, using in-memory tracking");
+            localAudits.push({ _id: tempId, url, status: 'pending', timestamp: new Date() });
+        }
+
+        // Start audit in background
+        processAudit(tempId, url);
+
+        res.json({ auditId: tempId });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Failed to start audit' });
+        console.error('Analysis request failed:', error);
+        res.status(500).json({ error: 'Failed to start analysis' });
     }
 });
 
-app.get('/api/audits/:id', async (req, res) => { // Made async
+app.get('/api/status/:id', async (req, res) => {
     try {
-        const audit = await Audit.findById(req.params.id);
+        const { id } = req.params;
+        let audit;
+
+        if (mongoose.connection.readyState === 1) {
+            audit = await Audit.findById(id);
+        } else {
+            audit = localAudits.find(a => a._id.toString() === id);
+        }
+
         if (!audit) return res.status(404).json({ error: 'Audit not found' });
 
-        // Mongoose handles JSON automatically, so no specific parsing logic needed if type is Object/Mixed
-        // But keeping resonse format consistent
-        res.json(audit);
+        res.json({
+            status: audit.status,
+            result: audit.result,
+            error: audit.error,
+            score: audit.score
+        });
     } catch (error) {
-        res.status(500).json({ error: 'Error fetching audit' });
+        res.status(500).json({ error: 'Status check failed' });
     }
 });
 
+app.get('/api/history', async (req, res) => {
+    try {
+        if (mongoose.connection.readyState === 1) {
+            const history = await Audit.find().sort({ timestamp: -1 }).limit(5);
+            res.json(history);
+        } else {
+            res.json(localAudits.slice(-5).reverse());
+        }
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch history' });
+    }
+});
+
+// Helper Function
 async function processAudit(auditId, url) {
     try {
-        console.log(`Starting audit for ${url} (ID: ${auditId})`);
+        console.log(`Starting audit for ${url}`);
 
         // Update status to processing
-        await Audit.findByIdAndUpdate(auditId, { status: 'processing' });
+        if (mongoose.connection.readyState === 1) {
+            await Audit.findByIdAndUpdate(auditId, { status: 'processing' });
+        } else {
+            const a = localAudits.find(x => x._id.toString() === auditId.toString());
+            if (a) a.status = 'processing';
+        }
 
-        // Run the audit
+        // Run the actual audit
         const result = await runAudit(url);
 
         // Save success
-        await Audit.findByIdAndUpdate(auditId, {
-            status: 'completed',
-            result: result,
-            score: result.overall_score || 0
-        });
-
-        console.log(`Audit completed for ${url}`);
+        if (mongoose.connection.readyState === 1) {
+            await Audit.findByIdAndUpdate(auditId, {
+                status: 'completed',
+                result: result,
+                score: result.overall_score || 0
+            });
+        } else {
+            const a = localAudits.find(x => x._id.toString() === auditId.toString());
+            if (a) {
+                a.status = 'completed';
+                a.result = result;
+                a.score = result.overall_score || 0;
+            }
+        }
     } catch (error) {
-        console.error(`Audit failed for ${url}:`, error);
+        console.error(`Audit failed:`, error);
 
         // Save failure
-        await Audit.findByIdAndUpdate(auditId, {
-            status: 'failed',
-            error: error.message || 'Unknown error'
-        });
+        if (mongoose.connection.readyState === 1) {
+            await Audit.findByIdAndUpdate(auditId, {
+                status: 'failed',
+                error: error.message || 'Unknown error'
+            });
+        } else {
+            const a = localAudits.find(x => x._id.toString() === auditId.toString());
+            if (a) {
+                a.status = 'failed';
+                a.error = error.message;
+            }
+        }
     }
 }
 
-
 // --- SERVE REACT FRONTEND ---
-import path from 'path';
-import { fileURLToPath } from 'url';
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Serve static files from the React app (client/dist)
 app.use(express.static(path.join(__dirname, '../client/dist')));
 
-// The "catchall" handler: for any request that doesn't
-// match one above, send back React's index.html file.
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, '../client/dist/index.html'));
 });
-// ----------------------------
 
+// Start Server
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
 });
